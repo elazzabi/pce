@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -108,6 +109,71 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("already current", second.stdout)
         self.assertEqual(version.stat().st_ino, first_stat.st_ino)
         self.assertEqual(version.stat().st_mtime_ns, first_stat.st_mtime_ns)
+
+    def test_repeat_tolerates_runtime_bytecode(self) -> None:
+        first = self.run_installer()
+        executable = self.prefix / "bin" / "pce"
+
+        smoke = subprocess.run(
+            [str(executable), "--version"],
+            cwd=self.root,
+            env={
+                **os.environ,
+                "HOME": str(self.home),
+                "CODEX_HOME": str(self.codex_home),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        second = self.run_installer()
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(smoke.returncode, 0, smoke.stderr)
+        self.assertTrue(
+            (self.prefix / "lib" / "pce" / "current" / "scripts" / "__pycache__").is_dir()
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("already current", second.stdout)
+
+    def test_upgrades_a_validated_managed_install(self) -> None:
+        previous_version = "0.0.9"
+        managed = self.prefix / "lib" / "pce"
+        previous_root = managed / "versions" / previous_version
+        for relative in (
+            "SKILL.md",
+            "references/storage-model.md",
+            "scripts/pce.py",
+            "scripts/pce_ui.py",
+        ):
+            destination = previous_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, destination)
+        previous_program = previous_root / "scripts" / "pce.py"
+        previous_program.write_text(
+            previous_program.read_text(encoding="utf-8").replace(
+                f'PCE_VERSION = "{VERSION}"',
+                f'PCE_VERSION = "{previous_version}"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        previous_program.chmod(0o755)
+
+        (managed / "current").symlink_to(f"versions/{previous_version}")
+        executable = self.prefix / "bin" / "pce"
+        executable.parent.mkdir(parents=True)
+        executable.symlink_to("../lib/pce/current/scripts/pce.py")
+        skill = self.codex_home / "skills" / "personal-compound"
+        skill.parent.mkdir(parents=True)
+        skill.symlink_to(managed / "current")
+
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.readlink(managed / "current"), f"versions/{VERSION}")
+        self.assertTrue((managed / "versions" / VERSION / "scripts" / "pce.py").is_file())
+        self.assertIn(f'PCE_VERSION = "{previous_version}"', previous_program.read_text())
 
     def test_refuses_occupied_executable_without_overwriting(self) -> None:
         occupied = self.prefix / "bin" / "pce"

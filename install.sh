@@ -40,6 +40,82 @@ assert_owned_link_or_absent() {
   fi
 }
 
+validate_version_tree() {
+  version_root=$1
+  expected_version=$2
+  compare_with_source=$3
+  mismatch_message="refusing to replace an existing PCE version that differs: $version_root"
+
+  [ -d "$version_root" ] && [ ! -L "$version_root" ] || fail "$mismatch_message"
+  for relative in $PAYLOAD_DIRECTORIES; do
+    [ -d "$version_root/$relative" ] && [ ! -L "$version_root/$relative" ] ||
+      fail "$mismatch_message"
+  done
+  for relative in $PAYLOAD_FILES; do
+    [ -f "$version_root/$relative" ] && [ ! -L "$version_root/$relative" ] ||
+      fail "$mismatch_message"
+  done
+
+  unexpected_entry=$(find "$version_root" \
+    ! -path "$version_root" \
+    ! -path "$version_root/SKILL.md" \
+    ! -path "$version_root/references" \
+    ! -path "$version_root/references/storage-model.md" \
+    ! -path "$version_root/scripts" \
+    ! -path "$version_root/scripts/pce.py" \
+    ! -path "$version_root/scripts/pce_ui.py" \
+    ! -path "$version_root/scripts/__pycache__" \
+    ! -path "$version_root/scripts/__pycache__/*" \
+    -print -quit) || fail "$mismatch_message"
+  [ -z "$unexpected_entry" ] || fail "$mismatch_message"
+
+  bytecode_root=$version_root/scripts/__pycache__
+  if path_exists "$bytecode_root"; then
+    [ -d "$bytecode_root" ] && [ ! -L "$bytecode_root" ] || fail "$mismatch_message"
+    unexpected_bytecode=$(find "$bytecode_root" \
+      ! -path "$bytecode_root" \
+      \( ! -type f -o ! -name '*.pyc' \) \
+      -print -quit) || fail "$mismatch_message"
+    [ -z "$unexpected_bytecode" ] || fail "$mismatch_message"
+  fi
+
+  installed_version=$(sed -n 's/^PCE_VERSION = "\([^"]*\)"/\1/p' "$version_root/scripts/pce.py")
+  [ "$installed_version" = "$expected_version" ] || fail "$mismatch_message"
+  [ -x "$version_root/scripts/pce.py" ] || fail "$mismatch_message"
+  if [ "$compare_with_source" -eq 1 ]; then
+    for relative in $PAYLOAD_FILES; do
+      cmp -s "$SOURCE_ROOT/$relative" "$version_root/$relative" || fail "$mismatch_message"
+    done
+  fi
+}
+
+validate_managed_upgrade_root() {
+  [ -d "$VERSIONS_ROOT" ] && [ ! -L "$VERSIONS_ROOT" ] ||
+    fail "refusing to adopt an existing unmanaged directory: $MANAGED_ROOT"
+  [ -L "$CURRENT_PATH" ] ||
+    fail "refusing to adopt an existing unmanaged directory: $MANAGED_ROOT"
+
+  previous_target=$(readlink "$CURRENT_PATH")
+  case "$previous_target" in
+    versions/*) previous_version=${previous_target#versions/} ;;
+    *) fail "refusing to overwrite unrelated target: $CURRENT_PATH" ;;
+  esac
+  case "$previous_version" in
+    ''|*[!0-9.]*|*/*) fail "refusing to overwrite unrelated target: $CURRENT_PATH" ;;
+  esac
+  validate_version_tree "$MANAGED_ROOT/$previous_target" "$previous_version" 0
+
+  unexpected_managed_entry=$(find "$MANAGED_ROOT" \
+    ! -path "$MANAGED_ROOT" \
+    ! -path "$CURRENT_PATH" \
+    ! -path "$VERSIONS_ROOT" \
+    ! -path "$VERSIONS_ROOT/*" \
+    -print -quit) ||
+    fail "refusing to adopt an existing unmanaged directory: $MANAGED_ROOT"
+  [ -z "$unexpected_managed_entry" ] ||
+    fail "refusing to adopt an existing unmanaged directory: $MANAGED_ROOT"
+}
+
 replace_link() {
   python3 - "$1" "$2" <<'PY'
 import os
@@ -108,30 +184,20 @@ SKILL_TARGET=$MANAGED_ROOT/current
 if path_exists "$PREFIX" && [ ! -d "$PREFIX" ]; then
   fail "installation prefix is not a directory: $PREFIX"
 fi
-if path_exists "$MANAGED_ROOT" && [ ! -d "$MANAGED_ROOT" ]; then
+if path_exists "$MANAGED_ROOT" && { [ ! -d "$MANAGED_ROOT" ] || [ -L "$MANAGED_ROOT" ]; }; then
   fail "refusing to overwrite unrelated target: $MANAGED_ROOT"
 fi
+CURRENT_VALIDATED=0
 if path_exists "$VERSION_ROOT"; then
-  [ -d "$VERSION_ROOT" ] && [ ! -L "$VERSION_ROOT" ] ||
-    fail "refusing to overwrite unrelated target: $VERSION_ROOT"
-  expected_entries=0
-  for _entry in $PAYLOAD_DIRECTORIES $PAYLOAD_FILES; do
-    expected_entries=$((expected_entries + 1))
-  done
-  entry_count=$(find "$VERSION_ROOT" ! -path "$VERSION_ROOT" | wc -l | tr -d '[:space:]')
-  [ "$entry_count" = "$expected_entries" ] ||
-    fail "refusing to replace an existing PCE version that differs: $VERSION_ROOT"
-  for relative in $PAYLOAD_FILES; do
-    cmp -s "$SOURCE_ROOT/$relative" "$VERSION_ROOT/$relative" ||
-      fail "refusing to replace an existing PCE version that differs: $VERSION_ROOT"
-  done
-  [ -x "$VERSION_ROOT/scripts/pce.py" ] ||
-    fail "refusing to replace an existing PCE version that differs: $VERSION_ROOT"
+  validate_version_tree "$VERSION_ROOT" "$PCE_VERSION" 1
 elif path_exists "$MANAGED_ROOT"; then
-  fail "refusing to adopt an existing unmanaged directory: $MANAGED_ROOT"
+  validate_managed_upgrade_root
+  CURRENT_VALIDATED=1
 fi
 
-assert_owned_link_or_absent "$CURRENT_PATH" "$CURRENT_TARGET"
+if [ "$CURRENT_VALIDATED" -eq 0 ]; then
+  assert_owned_link_or_absent "$CURRENT_PATH" "$CURRENT_TARGET"
+fi
 assert_owned_link_or_absent "$EXECUTABLE_PATH" "$EXECUTABLE_TARGET"
 assert_owned_link_or_absent "$SKILL_PATH" "$SKILL_TARGET"
 
