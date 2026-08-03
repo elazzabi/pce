@@ -1707,6 +1707,7 @@ class PersonalCompoundTest(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
         with (
+            patch.object(pce.sys, "platform", "darwin"),
             patch.object(pce, "service_paths", return_value=paths),
             patch.object(pce, "service_is_loaded", side_effect=[False, True]),
             patch.object(pce, "run", side_effect=run_git_or_succeed) as run_mock,
