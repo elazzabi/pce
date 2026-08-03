@@ -323,6 +323,58 @@ class PersonalCompoundTest(unittest.TestCase):
 
         self.assertEqual(self.snapshot_paths(self.repo_a, pce.store_root()), before)
 
+    def test_store_checkout_and_source_paths_must_not_overlap(self) -> None:
+        nested_store = self.repo_a / "private-store"
+        with self.assertRaisesRegex(pce.PceError, "separate from product checkout"):
+            pce.discover_init_candidate(
+                [self.repo_a],
+                store=nested_store,
+                mode="quickstart",
+                central_commit=False,
+                service_enabled=False,
+                service_interval=30,
+            )
+        self.assertFalse(nested_store.exists())
+
+        source_nested_store = pce.SCRIPT_DIR.parent / ".pce-test-store-overlap"
+        self.assertFalse(source_nested_store.exists())
+        with self.assertRaisesRegex(pce.PceError, "separate from PCE source"):
+            pce.validate_store_path(source_nested_store)
+        self.assertFalse(source_nested_store.exists())
+
+        with pce.selected_store(nested_store):
+            with self.assertRaisesRegex(
+                pce.PceError,
+                "separate from product checkout",
+            ):
+                pce.setup_repo(self.repo_a)
+        self.assertFalse(nested_store.exists())
+
+    def test_store_validation_requires_a_real_git_root_and_accepts_gitfiles(self) -> None:
+        invalid = self.root / "invalid-git-store"
+        invalid.mkdir()
+        (invalid / ".git").write_text("not a gitfile\n", encoding="utf-8")
+        sentinel = invalid / "vault.md"
+        sentinel.write_text("preserve\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(pce.PceError, "non-empty knowledge store"):
+            pce.validate_store_path(invalid)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+
+        primary = self.root / "primary-knowledge"
+        primary.mkdir()
+        git(primary, "init", "-b", "main")
+        git(primary, "config", "user.name", "Personal Compound Test")
+        git(primary, "config", "user.email", "personal-compound@example.test")
+        (primary / "seed.md").write_text("seed\n", encoding="utf-8")
+        git(primary, "add", "seed.md")
+        git(primary, "commit", "-m", "knowledge: seed")
+        worktree = self.root / "knowledge-worktree"
+        git(primary, "worktree", "add", "-b", "knowledge-worktree", str(worktree))
+
+        self.assertTrue((worktree / ".git").is_file())
+        pce.validate_store_path(worktree)
+
     def test_store_root_reloads_persisted_config_but_environment_wins(self) -> None:
         configured = self.root / "configured store"
         overridden = self.root / "environment store"
@@ -595,7 +647,7 @@ class PersonalCompoundTest(unittest.TestCase):
         self.assertFalse((self.repo_b / pce.LOCAL_ROOT_NAME).exists())
         commit.assert_not_called()
 
-    def test_init_treats_visible_unmanaged_artifacts_as_nonfatal_warnings(self) -> None:
+    def test_doctor_ignores_nested_paths_that_only_resemble_managed_artifacts(self) -> None:
         concepts = self.repo_a / "nested" / "CONCEPTS.md"
         concepts.parent.mkdir(parents=True)
         concepts.write_text("tracked\n", encoding="utf-8")
@@ -618,9 +670,22 @@ class PersonalCompoundTest(unittest.TestCase):
             phase for phase in result["phases"] if phase["phase"] == "doctor"
         )
         self.assertEqual(doctor_phase["status"], "noop")
-        self.assertIn("nested/CONCEPTS.md", " ".join(doctor_phase["warnings"]))
-        self.assertFalse(diagnosis["ok"])
-        self.assertTrue(diagnosis["visible_personal_artifacts"])
+        self.assertNotIn("warnings", doctor_phase)
+        self.assertTrue(diagnosis["ok"])
+        self.assertEqual(diagnosis["visible_personal_artifacts"], [])
+
+    def test_doctor_ignores_a_modified_tracked_root_concepts_file(self) -> None:
+        concepts = self.repo_a / "CONCEPTS.md"
+        concepts.write_text("tracked\n", encoding="utf-8")
+        git(self.repo_a, "add", "CONCEPTS.md")
+        git(self.repo_a, "commit", "-m", "test: add team concepts")
+        pce.setup_repo(self.repo_a)
+        concepts.write_text("dirty but team-owned\n", encoding="utf-8")
+
+        diagnosis = pce.doctor(self.repo_a)
+
+        self.assertTrue(diagnosis["ok"])
+        self.assertEqual(diagnosis["visible_personal_artifacts"], [])
 
     def test_init_publication_stops_after_checkout_or_doctor_failure(self) -> None:
         candidate = pce.discover_init_candidate(
@@ -980,6 +1045,133 @@ class PersonalCompoundTest(unittest.TestCase):
             pce.namespace(self.repo_b)[1]["key"],
         )
 
+    def test_relative_local_origin_is_stable_across_working_directories(self) -> None:
+        git(self.repo_a, "remote", "set-url", "origin", "../upstream.git")
+        expected = "local/" + (
+            (self.repo_a / "../upstream.git").resolve().as_posix().lstrip("/")
+        )
+        other_cwd = self.root / "other-cwd"
+        other_cwd.mkdir()
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(other_cwd)
+            canonical, key = pce.origin_info(self.repo_a)
+            pce.setup_repo(self.repo_a)
+            os.chdir(pce.store_root())
+            synced = pce.automatic_sync(commit=False)
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(canonical, expected)
+        self.assertEqual(key, pce.namespace(self.repo_a)[1]["key"])
+        self.assertTrue(synced["ok"])
+
+    def test_origin_errors_never_expose_embedded_credentials(self) -> None:
+        for raw in (
+            "https://user:top-secret@/missing-host.git",
+            "user:top-secret@unsupported-origin",
+            "https://user:top-secret@example.test:invalid/repo.git",
+            "https://user:top-secret@example.test\uff0fevil.git",
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(pce.PceError) as raised:
+                    pce.normalize_origin(raw)
+                message = str(raised.exception)
+                self.assertNotIn("top-secret", message)
+                self.assertNotIn(raw, message)
+
+    def test_tracking_inspection_failure_aborts_legacy_import_planning(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["git", "ls-files"],
+            128,
+            stdout="",
+            stderr="index is unreadable",
+        )
+
+        def fail_when_checked(
+            _args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd
+            if check:
+                raise pce.PceError("git ls-files failed: index is unreadable")
+            return failure
+
+        with (
+            patch.object(pce, "run", side_effect=fail_when_checked),
+            self.assertRaisesRegex(pce.PceError, "index is unreadable"),
+        ):
+            pce._tracked_legacy_paths(self.repo_a)
+
+    def test_setup_and_init_refuse_tracked_personal_paths(self) -> None:
+        config = self.repo_a / ".compound-engineering" / "config.local.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("docs_root: team-docs\n", encoding="utf-8")
+        git(self.repo_a, "add", ".compound-engineering/config.local.yaml")
+
+        with self.assertRaisesRegex(pce.PceError, "tracked personal"):
+            pce.discover_init_candidate(
+                [self.repo_a],
+                mode="quickstart",
+                central_commit=False,
+                service_enabled=False,
+                service_interval=30,
+            )
+        with self.assertRaisesRegex(pce.PceError, "tracked personal"):
+            pce.setup_repo(self.repo_a)
+        self.assertFalse(pce.store_root().exists())
+
+        local = self.repo_b / pce.LOCAL_ROOT_NAME / "plans" / "team.md"
+        local.parent.mkdir(parents=True)
+        local.write_text("team plan\n", encoding="utf-8")
+        git(self.repo_b, "add", f"{pce.LOCAL_ROOT_NAME}/plans/team.md")
+        with self.assertRaisesRegex(pce.PceError, "tracked personal"):
+            pce.discover_init_candidate(
+                [self.repo_b],
+                mode="quickstart",
+                central_commit=False,
+                service_enabled=False,
+                service_interval=30,
+            )
+
+    def test_init_rechecks_tracked_personal_paths_under_lock(self) -> None:
+        candidate = pce.discover_init_candidate(
+            [self.repo_a],
+            mode="quickstart",
+            central_commit=False,
+            service_enabled=False,
+            service_interval=30,
+        )
+        rediscover = pce._rediscover_init_candidate
+        calls = 0
+
+        def track_before_locked_rediscovery(
+            reviewed: pce.InitCandidate,
+        ) -> pce.InitCandidate:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                config = self.repo_a / ".compound-engineering" / "config.local.yaml"
+                config.parent.mkdir(parents=True)
+                config.write_text("docs_root: team-docs\n", encoding="utf-8")
+                git(self.repo_a, "add", ".compound-engineering/config.local.yaml")
+            return rediscover(reviewed)
+
+        with (
+            patch.object(
+                pce,
+                "_rediscover_init_candidate",
+                side_effect=track_before_locked_rediscovery,
+            ),
+            patch.object(pce, "setup_repo") as setup,
+        ):
+            result = pce.publish_init_candidate(candidate)
+
+        self.assertFalse(result["ok"])
+        setup.assert_not_called()
+
     def test_setup_is_idempotent(self) -> None:
         config_path = self.repo_a / ".compound-engineering" / "config.local.yaml"
         config_path.parent.mkdir(parents=True)
@@ -1126,6 +1318,127 @@ class PersonalCompoundTest(unittest.TestCase):
         self.assertEqual(len(result["skipped"]), 1)
         self.assertIn("no longer exists", result["skipped"][0]["reason"])
 
+    def test_automatic_sync_isolates_validation_os_errors_per_checkout(self) -> None:
+        pce.setup_repo(self.repo_a)
+        pce.setup_repo(self.repo_b)
+        real_newest_artifact_mtime = pce.newest_artifact_mtime
+
+        def fail_first_checkout(repo: Path, ns: Path) -> float | None:
+            if repo == self.repo_a.resolve():
+                raise OSError("validation read failed")
+            return real_newest_artifact_mtime(repo, ns)
+
+        with patch.object(
+            pce,
+            "newest_artifact_mtime",
+            side_effect=fail_first_checkout,
+        ):
+            result = pce.automatic_sync(commit=False)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failures"][0]["phase"], "validate")
+        self.assertIn("validation read failed", result["failures"][0]["error"])
+        self.assertEqual(len(result["sync"]), 1)
+        self.assertEqual(len(result["hydrate"]), 1)
+        self.assertEqual(result["sync"][0]["repository"], str(self.repo_b.resolve()))
+
+    def test_automatic_sync_isolates_sync_os_errors_per_checkout(self) -> None:
+        pce.setup_repo(self.repo_a)
+        pce.setup_repo(self.repo_b)
+        real_reconcile = pce.reconcile
+
+        def fail_first_checkout(
+            repo: Path,
+            mode: str,
+            *,
+            allow_delete: bool = False,
+        ) -> dict[str, object]:
+            if repo == self.repo_a.resolve() and mode == "sync":
+                raise OSError("sync write failed")
+            return real_reconcile(repo, mode, allow_delete=allow_delete)
+
+        with patch.object(pce, "reconcile", side_effect=fail_first_checkout):
+            result = pce.automatic_sync(commit=False)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failures"][0]["phase"], "sync")
+        self.assertIn("sync write failed", result["failures"][0]["error"])
+        self.assertEqual(len(result["sync"]), 1)
+        self.assertEqual(len(result["hydrate"]), 1)
+        self.assertEqual(result["sync"][0]["repository"], str(self.repo_b.resolve()))
+
+    def test_automatic_sync_isolates_hydrate_os_errors_per_checkout(self) -> None:
+        pce.setup_repo(self.repo_a)
+        pce.setup_repo(self.repo_b)
+        real_reconcile = pce.reconcile
+
+        def fail_first_checkout(
+            repo: Path,
+            mode: str,
+            *,
+            allow_delete: bool = False,
+        ) -> dict[str, object]:
+            if repo == self.repo_a.resolve() and mode == "hydrate":
+                raise OSError("hydrate write failed")
+            return real_reconcile(repo, mode, allow_delete=allow_delete)
+
+        with patch.object(pce, "reconcile", side_effect=fail_first_checkout):
+            result = pce.automatic_sync(commit=False)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failures"][0]["phase"], "hydrate")
+        self.assertIn("hydrate write failed", result["failures"][0]["error"])
+        self.assertEqual(len(result["sync"]), 2)
+        self.assertEqual(len(result["hydrate"]), 1)
+        self.assertEqual(
+            result["hydrate"][0]["repository"],
+            str(self.repo_b.resolve()),
+        )
+
+    def test_automatic_sync_retries_a_previously_failed_commit(self) -> None:
+        pce.setup_repo(self.repo_a)
+        ns, _ = pce.namespace(self.repo_a)
+        git(pce.store_root(), "config", "user.name", "Personal Compound Test")
+        git(
+            pce.store_root(),
+            "config",
+            "user.email",
+            "personal-compound@example.test",
+        )
+        pce.commit_store("knowledge: baseline", [ns])
+        self.write_artifact(self.repo_a, "solutions/retry.md", "retry me\n")
+        real_run = pce.run
+
+        def fail_first_commit(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[:3] == ["git", "-C", str(pce.store_root())] and "commit" in args:
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="temporary signing failure",
+                )
+            return real_run(args, cwd=cwd, check=check)
+
+        with patch.object(pce, "run", side_effect=fail_first_commit):
+            failed = pce.automatic_sync(commit=True)
+
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["failures"][-1]["phase"], "commit")
+        self.assertIn("temporary signing failure", failed["failures"][-1]["error"])
+        self.assertTrue(git_output(pce.store_root(), "diff", "--cached"))
+
+        retried = pce.automatic_sync(commit=True)
+
+        self.assertTrue(retried["ok"])
+        self.assertEqual(retried["sync"][0]["actions"], [])
+        self.assertTrue(retried["central_commit"]["committed"])
+        self.assertEqual(git_output(pce.store_root(), "diff", "--cached"), "")
+
     def test_unchanged_reconciliation_does_not_rewrite_local_state(self) -> None:
         pce.setup_repo(self.repo_a)
 
@@ -1250,6 +1563,31 @@ class PersonalCompoundTest(unittest.TestCase):
         )
         self.assertEqual(len(local_recoveries), 1)
 
+    def test_store_lock_rejects_an_invalid_store_without_creating_a_lock(self) -> None:
+        invalid_store = self.root / "invalid-store"
+        invalid_store.mkdir()
+        (invalid_store / "unrelated.txt").write_text(
+            "keep me unchanged\n",
+            encoding="utf-8",
+        )
+        before = self.snapshot_paths(invalid_store)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"PERSONAL_COMPOUND_HOME": str(invalid_store)},
+            ),
+            self.assertRaisesRegex(
+                pce.PceError,
+                "refusing to initialize Git in a non-empty knowledge store",
+            ),
+        ):
+            with pce.store_lock():
+                self.fail("invalid store lock unexpectedly acquired")
+
+        self.assertEqual(self.snapshot_paths(invalid_store), before)
+        self.assertFalse((invalid_store / ".pce.lock").exists())
+
     def test_cli_waits_for_store_lock(self) -> None:
         pce.ensure_store()
         lock_path = pce.store_root() / ".pce.lock"
@@ -1349,6 +1687,7 @@ class PersonalCompoundTest(unittest.TestCase):
 
     def test_service_install_writes_a_safe_launchd_definition(self) -> None:
         pce.ensure_store()
+        real_run = pce.run
         service_root = self.root / "service"
         paths = {
             "plist": service_root / "LaunchAgents" / "service.plist",
@@ -1356,10 +1695,21 @@ class PersonalCompoundTest(unittest.TestCase):
             "stdout": service_root / "Logs" / "stdout.log",
             "stderr": service_root / "Logs" / "stderr.log",
         }
+
+        def run_git_or_succeed(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "git":
+                return real_run(args, cwd=cwd, check=check)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
         with (
             patch.object(pce, "service_paths", return_value=paths),
             patch.object(pce, "service_is_loaded", side_effect=[False, True]),
-            patch.object(pce, "run") as run_mock,
+            patch.object(pce, "run", side_effect=run_git_or_succeed) as run_mock,
         ):
             result = pce.service_install(45)
 
@@ -1371,12 +1721,18 @@ class PersonalCompoundTest(unittest.TestCase):
         self.assertIn("--quiet", payload["ProgramArguments"])
         self.assertIn("--settle-seconds", payload["ProgramArguments"])
         self.assertNotIn("--allow-delete", payload["ProgramArguments"])
-        run_mock.assert_called_once_with(
-            ["launchctl", "bootstrap", pce.service_domain(), str(paths["plist"])]
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in run_mock.call_args_list
+                if call.args[0][0] == "launchctl"
+            ],
+            [["launchctl", "bootstrap", pce.service_domain(), str(paths["plist"])]],
         )
 
     def test_service_install_preserves_old_plist_when_bootout_fails(self) -> None:
         pce.ensure_store()
+        real_run = pce.run
         service_root = self.root / "bootout-service"
         paths = {
             "plist": service_root / "LaunchAgents" / "service.plist",
@@ -1389,18 +1745,34 @@ class PersonalCompoundTest(unittest.TestCase):
         old_payload["StartInterval"] = 30
         old_bytes = plistlib.dumps(old_payload, sort_keys=True)
         paths["plist"].write_bytes(old_bytes)
+
+        def run_git_or_fail_bootout(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "git":
+                return real_run(args, cwd=cwd, check=check)
+            raise pce.PceError("bootout failed")
+
         with (
             patch.object(pce.sys, "platform", "darwin"),
             patch.object(pce, "service_paths", return_value=paths),
             patch.object(pce, "service_is_loaded", return_value=True),
-            patch.object(pce, "run", side_effect=pce.PceError("bootout failed")) as run_mock,
+            patch.object(pce, "run", side_effect=run_git_or_fail_bootout) as run_mock,
             self.assertRaisesRegex(pce.PceError, "bootout failed"),
         ):
             pce.service_install(45)
 
         self.assertEqual(paths["plist"].read_bytes(), old_bytes)
-        run_mock.assert_called_once_with(
-            ["launchctl", "bootout", pce.service_domain(), str(paths["plist"])]
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in run_mock.call_args_list
+                if call.args[0][0] == "launchctl"
+            ],
+            [["launchctl", "bootout", pce.service_domain(), str(paths["plist"])]],
         )
         with (
             patch.object(pce.sys, "platform", "darwin"),
@@ -1410,11 +1782,21 @@ class PersonalCompoundTest(unittest.TestCase):
             retry = pce.discover_service_candidate(enabled=True, interval=45)
         self.assertEqual(retry.action, "update")
 
+        def run_git_or_succeed(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "git":
+                return real_run(args, cwd=cwd, check=check)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
         with (
             patch.object(pce.sys, "platform", "darwin"),
             patch.object(pce, "service_paths", return_value=paths),
             patch.object(pce, "service_is_loaded", side_effect=[True, True]),
-            patch.object(pce, "run") as retry_run,
+            patch.object(pce, "run", side_effect=run_git_or_succeed) as retry_run,
         ):
             retried = pce.service_install(45)
         self.assertTrue(retried["loaded"])
@@ -1422,7 +1804,151 @@ class PersonalCompoundTest(unittest.TestCase):
             plistlib.loads(paths["plist"].read_bytes())["StartInterval"],
             45,
         )
-        self.assertEqual(retry_run.call_count, 2)
+        self.assertEqual(
+            [
+                call.args[0][1]
+                for call in retry_run.call_args_list
+                if call.args[0][0] == "launchctl"
+            ],
+            ["bootout", "bootstrap"],
+        )
+
+    def test_service_install_restores_loaded_service_after_write_failure(self) -> None:
+        pce.ensure_store()
+        real_run = pce.run
+        service_root = self.root / "write-rollback-service"
+        paths = {
+            "plist": service_root / "LaunchAgents" / "service.plist",
+            "status": service_root / "Support" / "status.json",
+            "stdout": service_root / "Logs" / "stdout.log",
+            "stderr": service_root / "Logs" / "stderr.log",
+        }
+        paths["plist"].parent.mkdir(parents=True)
+        old_bytes = plistlib.dumps(pce.desired_service_plist(30), sort_keys=True)
+        paths["plist"].write_bytes(old_bytes)
+
+        def run_git_or_succeed(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if args[0] == "git":
+                return real_run(args, cwd=cwd, check=check)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with (
+            patch.object(pce.sys, "platform", "darwin"),
+            patch.object(pce, "service_paths", return_value=paths),
+            patch.object(pce, "service_is_loaded", return_value=True),
+            patch.object(pce, "atomic_write_text", side_effect=OSError("write failed")),
+            patch.object(pce, "run", side_effect=run_git_or_succeed) as run_mock,
+            self.assertRaisesRegex(pce.PceError, "write failed"),
+        ):
+            pce.service_install(45)
+
+        self.assertEqual(paths["plist"].read_bytes(), old_bytes)
+        self.assertEqual(
+            [
+                call.args[0][1]
+                for call in run_mock.call_args_list
+                if call.args[0][0] == "launchctl"
+            ],
+            ["bootout", "bootstrap"],
+        )
+
+    def test_service_install_restores_loaded_service_after_bootstrap_failure(self) -> None:
+        pce.ensure_store()
+        real_run = pce.run
+        service_root = self.root / "bootstrap-rollback-service"
+        paths = {
+            "plist": service_root / "LaunchAgents" / "service.plist",
+            "status": service_root / "Support" / "status.json",
+            "stdout": service_root / "Logs" / "stdout.log",
+            "stderr": service_root / "Logs" / "stderr.log",
+        }
+        paths["plist"].parent.mkdir(parents=True)
+        old_bytes = plistlib.dumps(pce.desired_service_plist(30), sort_keys=True)
+        paths["plist"].write_bytes(old_bytes)
+        bootstrap_attempts = 0
+
+        def fail_replacement_bootstrap(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal bootstrap_attempts
+            if args[0] == "git":
+                return real_run(args, cwd=cwd, check=check)
+            if args[1] == "bootstrap":
+                bootstrap_attempts += 1
+                if bootstrap_attempts == 1:
+                    raise pce.PceError("replacement bootstrap failed")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with (
+            patch.object(pce.sys, "platform", "darwin"),
+            patch.object(pce, "service_paths", return_value=paths),
+            patch.object(pce, "service_is_loaded", return_value=True),
+            patch.object(pce, "run", side_effect=fail_replacement_bootstrap) as run_mock,
+            self.assertRaisesRegex(pce.PceError, "replacement bootstrap failed"),
+        ):
+            pce.service_install(45)
+
+        self.assertEqual(paths["plist"].read_bytes(), old_bytes)
+        self.assertEqual(
+            [
+                call.args[0][1]
+                for call in run_mock.call_args_list
+                if call.args[0][0] == "launchctl"
+            ],
+            ["bootout", "bootstrap", "bootstrap"],
+        )
+
+    def test_service_install_reports_rollback_bootstrap_failure(self) -> None:
+        pce.ensure_store()
+        real_run = pce.run
+        service_root = self.root / "failed-rollback-service"
+        paths = {
+            "plist": service_root / "LaunchAgents" / "service.plist",
+            "status": service_root / "Support" / "status.json",
+            "stdout": service_root / "Logs" / "stdout.log",
+            "stderr": service_root / "Logs" / "stderr.log",
+        }
+        paths["plist"].parent.mkdir(parents=True)
+        old_bytes = plistlib.dumps(pce.desired_service_plist(30), sort_keys=True)
+        paths["plist"].write_bytes(old_bytes)
+        bootstrap_attempts = 0
+
+        def fail_both_bootstraps(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal bootstrap_attempts
+            if args[0] == "git":
+                return real_run(args, cwd=cwd, check=check)
+            if args[1] == "bootstrap":
+                bootstrap_attempts += 1
+                label = "replacement" if bootstrap_attempts == 1 else "rollback"
+                raise pce.PceError(f"{label} bootstrap failed")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with (
+            patch.object(pce.sys, "platform", "darwin"),
+            patch.object(pce, "service_paths", return_value=paths),
+            patch.object(pce, "service_is_loaded", return_value=True),
+            patch.object(pce, "run", side_effect=fail_both_bootstraps),
+            self.assertRaisesRegex(
+                pce.PceError,
+                "replacement bootstrap failed.*service rollback failed.*rollback bootstrap failed",
+            ),
+        ):
+            pce.service_install(45)
+
+        self.assertEqual(paths["plist"].read_bytes(), old_bytes)
 
     def test_central_commit_does_not_touch_product_git_state(self) -> None:
         tracked = self.repo_a / "tracked.txt"
@@ -1479,6 +2005,71 @@ class PersonalCompoundTest(unittest.TestCase):
                 "--format=",
                 "HEAD",
             ),
+        )
+
+    def test_sync_commit_ignores_missing_recovery_pathspec(self) -> None:
+        pce.setup_repo(self.repo_a)
+        ns, _ = pce.namespace(self.repo_a)
+        git(pce.store_root(), "config", "user.name", "Personal Compound Test")
+        git(
+            pce.store_root(),
+            "config",
+            "user.email",
+            "personal-compound@example.test",
+        )
+        pce.commit_store("knowledge: baseline", [ns])
+        self.write_artifact(self.repo_a, "solutions/committed.md", "commit me\n")
+        key = str(pce.namespace(self.repo_a)[1]["key"])
+        recovery = pce.store_root() / "recovery" / key
+        self.assertFalse(recovery.exists())
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "sync",
+                "--repo",
+                str(self.repo_a),
+                "--commit",
+                "--json",
+            ],
+            env=os.environ.copy(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["central_commit"]["committed"])
+        self.assertIn(
+            "projects/",
+            git_output(pce.store_root(), "show", "--name-only", "--format=", "HEAD"),
+        )
+
+    def test_commit_store_includes_a_tracked_deleted_path(self) -> None:
+        pce.ensure_store()
+        recovery = pce.store_root() / "recovery" / "tracked-deletion"
+        recovery.mkdir(parents=True)
+        artifact = recovery / "artifact.md"
+        artifact.write_text("recover me\n", encoding="utf-8")
+        git(pce.store_root(), "config", "user.name", "Personal Compound Test")
+        git(
+            pce.store_root(),
+            "config",
+            "user.email",
+            "personal-compound@example.test",
+        )
+        pce.commit_store("knowledge: add recovery", [recovery])
+        artifact.unlink()
+        recovery.rmdir()
+
+        result = pce.commit_store("knowledge: remove recovery", [recovery])
+
+        self.assertTrue(result["committed"])
+        self.assertNotIn(
+            "recovery/tracked-deletion/artifact.md",
+            git_output(pce.store_root(), "ls-tree", "-r", "--name-only", "HEAD"),
         )
 
     def test_harvest_paginates_oldest_changes_after_watermark(self) -> None:
@@ -1823,9 +2414,60 @@ class CliPresentationTest(unittest.TestCase):
     def test_noninteractive_init_refuses_without_creating_store(self) -> None:
         refusal = self.subprocess_cli("init", "--json")
         self.assertEqual(refusal.returncode, 2)
-        self.assertEqual(json.loads(refusal.stdout)["error"], "interactive_required")
+        payload = json.loads(refusal.stdout)
+        self.assertEqual(
+            set(payload),
+            {"ok", "error", "message"},
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "interactive_required")
         self.assertEqual(refusal.stderr, "")
         self.assertFalse(self.store.exists())
+
+    def test_json_mode_returns_a_stable_error_envelope_for_pce_errors(self) -> None:
+        for arguments in (
+            ["--json", "restore", "--repo", str(self.repo), "--path", "missing.md"],
+            ["restore", "--repo", str(self.repo), "--path", "missing.md", "--json"],
+        ):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.in_process_cli(arguments)
+                payload = json.loads(output)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(error, "")
+                self.assertEqual(set(payload), {"ok", "error", "message"})
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "pce_error")
+                self.assertIn("central artifact does not exist", payload["message"])
+
+    def test_sync_all_overwrites_stale_status_after_an_early_failure(self) -> None:
+        invalid_store = self.root / "invalid-store"
+        invalid_store.mkdir()
+        (invalid_store / "unrelated.txt").write_text("not a store\n", encoding="utf-8")
+        status_file = self.root / "service" / "status.json"
+        pce.write_json(status_file, {"ok": True, "stale": True})
+
+        code, output, error = self.in_process_cli(
+            [
+                "sync-all",
+                "--quiet",
+                "--status-file",
+                str(status_file),
+            ],
+            environment={"PERSONAL_COMPOUND_HOME": str(invalid_store)},
+        )
+        payload = json.loads(status_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertIn("refusing to initialize Git", error)
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("stale", payload)
+        self.assertIn("started_at", payload)
+        self.assertIn("finished_at", payload)
+        self.assertEqual(payload["failures"][0]["phase"], "sync-all")
+        self.assertIn("refusing to initialize Git", payload["failures"][0]["error"])
+        self.assertFalse((invalid_store / ".pce.lock").exists())
 
     def test_confirmed_init_publishes_and_returns_nonzero_with_retry_guidance(self) -> None:
         candidate = pce.discover_init_candidate(

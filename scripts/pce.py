@@ -188,7 +188,30 @@ def selected_store(root: Path) -> Iterable[None]:
             os.environ[STORE_ENV] = previous
 
 
-def normalize_origin(raw: str) -> str:
+def paths_overlap(first: Path, second: Path) -> bool:
+    first = first.expanduser().resolve()
+    second = second.expanduser().resolve()
+    return (
+        first == second
+        or first.is_relative_to(second)
+        or second.is_relative_to(first)
+    )
+
+
+def validate_checkout_store_separation(
+    repo: Path,
+    root: Path | None = None,
+) -> None:
+    selected = (root or store_root()).expanduser().resolve()
+    checkout = repo.expanduser().resolve()
+    if paths_overlap(selected, checkout):
+        raise PceError(
+            "knowledge store must be separate from product checkout: "
+            f"{checkout}"
+        )
+
+
+def normalize_origin(raw: str, *, relative_to: Path | None = None) -> str:
     value = raw.strip()
     if not value:
         raise PceError("origin has no URL")
@@ -197,20 +220,26 @@ def normalize_origin(raw: str) -> str:
     if scp_match:
         host, path = scp_match.groups()
     elif "://" in value:
-        parsed = urlparse(value)
-        host = parsed.hostname or ""
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
+        try:
+            parsed = urlparse(value)
+            host = parsed.hostname or ""
+            port = parsed.port
+        except ValueError as exc:
+            raise PceError("could not normalize origin URL") from exc
+        if port is not None:
+            host = f"{host}:{port}"
         path = parsed.path
     else:
         path_obj = Path(value).expanduser()
         if path_obj.is_absolute() or value.startswith("."):
+            if not path_obj.is_absolute() and relative_to is not None:
+                path_obj = relative_to / path_obj
             return f"local/{path_obj.resolve().as_posix().lstrip('/')}"
-        raise PceError(f"unsupported origin URL: {value}")
+        raise PceError("unsupported origin URL")
 
     path = path.strip("/").removesuffix(".git").strip("/")
     if not host or not path:
-        raise PceError(f"could not normalize origin URL: {value}")
+        raise PceError("could not normalize origin URL")
     normalized_host = host.lower()
     normalized_path = (
         path.lower()
@@ -222,7 +251,7 @@ def normalize_origin(raw: str) -> str:
 
 def origin_info(repo: Path) -> tuple[str, str]:
     raw = git(repo, "remote", "get-url", "origin")
-    canonical = normalize_origin(raw)
+    canonical = normalize_origin(raw, relative_to=repo)
     slug = re.sub(
         r"[^a-zA-Z0-9._-]+",
         "-",
@@ -231,11 +260,12 @@ def origin_info(repo: Path) -> tuple[str, str]:
     suffix = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
     key = f"{slug}--{suffix}"
     if not key:
-        raise PceError(f"origin produced an empty key: {raw}")
+        raise PceError("origin produced an empty key")
     return canonical, key
 
 
 def namespace(repo: Path) -> tuple[Path, dict[str, object]]:
+    validate_checkout_store_separation(repo)
     canonical, key = origin_info(repo)
     root = store_root() / "projects" / key
     metadata = {
@@ -266,6 +296,10 @@ def write_json(path: Path, value: object) -> None:
 
 
 def atomic_write_text(path: Path, value: str) -> None:
+    atomic_write_bytes(path, value.encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, raw_temp = tempfile.mkstemp(
         dir=path.parent,
@@ -274,7 +308,7 @@ def atomic_write_text(path: Path, value: str) -> None:
     )
     temp = Path(raw_temp)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
@@ -334,10 +368,22 @@ def validate_store_path(root: Path) -> None:
             f"{root}"
         )
     source_root = SCRIPT_DIR.parent
-    if source_root == root or source_root.is_relative_to(root):
+    if paths_overlap(source_root, root):
         raise PceError(f"knowledge store must be separate from PCE source: {root}")
-    if not root.exists() or (root / ".git").exists():
+    if not root.exists():
         return
+    git_entry = root / ".git"
+    if git_entry.exists():
+        result = run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=False,
+        )
+        if (
+            result.returncode == 0
+            and result.stdout.strip()
+            and Path(result.stdout.strip()).expanduser().resolve() == root
+        ):
+            return
     meaningful_entries = [path for path in root.iterdir() if path.name != ".pce.lock"]
     if meaningful_entries:
         raise PceError(
@@ -363,6 +409,9 @@ def ensure_store() -> Path:
 @contextmanager
 def store_lock() -> Iterable[None]:
     root = store_root()
+    # Validate before creating the directory or lock file. Invalid store choices
+    # must remain byte-for-byte untouched by a rejected command.
+    validate_store_path(root)
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".pce.lock"
     with lock_path.open("a+", encoding="utf-8") as handle:
@@ -394,6 +443,32 @@ def is_tracked(repo: Path, rel: str) -> bool:
         ).returncode
         == 0
     )
+
+
+def tracked_personal_setup_paths(repo: Path) -> tuple[str, ...]:
+    result = run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "ls-files",
+            "-z",
+            "--",
+            LOCAL_ROOT_NAME,
+            ".compound-engineering/config.local.yaml",
+        ]
+    )
+    return tuple(item for item in result.stdout.split("\0") if item)
+
+
+def validate_checkout_setup(repo: Path, root: Path | None = None) -> None:
+    validate_checkout_store_separation(repo, root)
+    tracked = tracked_personal_setup_paths(repo)
+    if tracked:
+        raise PceError(
+            "refusing to configure tracked personal Compound Engineering paths: "
+            + ", ".join(tracked)
+        )
 
 
 def update_metadata(repo: Path, ns: Path, base: dict[str, object]) -> None:
@@ -522,7 +597,6 @@ def _tracked_legacy_paths(repo: Path) -> set[str]:
     candidates.append("CONCEPTS.md")
     result = run(
         ["git", "-C", str(repo), "ls-files", "-z", "--", *candidates],
-        check=False,
     )
     return {item for item in result.stdout.split("\0") if item}
 
@@ -843,9 +917,17 @@ def reconcile(
 
 def commit_store(message: str, paths: Iterable[Path]) -> dict[str, object]:
     root = ensure_store()
-    relative_paths = sorted(
-        {path.resolve().relative_to(root).as_posix() for path in paths}
+    requested_paths = sorted(
+        {
+            path.resolve().relative_to(root).as_posix()
+            for path in paths
+        }
     )
+    relative_paths = [
+        relative
+        for relative in requested_paths
+        if (root / relative).exists() or git(root, "ls-files", "--", relative)
+    ]
     if not relative_paths:
         return {"committed": False, "reason": "no central paths supplied"}
     status = git(root, "status", "--porcelain", "--", *relative_paths)
@@ -946,7 +1028,7 @@ def automatic_sync(
                 )
                 continue
             available.append((repo, expected_key))
-        except PceError as exc:
+        except (PceError, OSError) as exc:
             failures.append(
                 {
                     "phase": "validate",
@@ -962,7 +1044,7 @@ def automatic_sync(
             result = reconcile(repo, "sync")
             sync_results.append(result)
             successful.append((repo, key))
-        except PceError as exc:
+        except (PceError, OSError) as exc:
             failures.append(
                 {
                     "phase": "sync",
@@ -975,7 +1057,7 @@ def automatic_sync(
     for repo, _ in successful:
         try:
             hydrate_results.append(reconcile(repo, "hydrate"))
-        except PceError as exc:
+        except (PceError, OSError) as exc:
             failures.append(
                 {
                     "phase": "hydrate",
@@ -984,17 +1066,24 @@ def automatic_sync(
                 }
             )
 
-    changed_namespaces = {
-        store_root() / "projects" / key
-        for result, (_, key) in zip(sync_results, successful, strict=True)
-        if result["actions"]
+    successful_namespaces = {
+        store_root() / "projects" / key for _repo, key in successful
     }
     central_commit: dict[str, object] | None = None
-    if commit and changed_namespaces:
-        central_commit = commit_store(
-            "chore: auto-sync compound knowledge",
-            changed_namespaces,
-        )
+    if commit and successful_namespaces:
+        try:
+            central_commit = commit_store(
+                "chore: auto-sync compound knowledge",
+                successful_namespaces,
+            )
+        except PceError as exc:
+            failures.append(
+                {
+                    "phase": "commit",
+                    "repository": str(store_root()),
+                    "error": str(exc),
+                }
+            )
 
     return {
         "started_at": started_at,
@@ -1007,6 +1096,32 @@ def automatic_sync(
         "skipped": skipped,
         "failures": failures,
         "central_commit": central_commit,
+    }
+
+
+def automatic_sync_failure(
+    started_at: str,
+    phase: str,
+    exc: BaseException,
+) -> dict[str, object]:
+    """Build the durable status contract for a sync-all failure before results exist."""
+
+    return {
+        "started_at": started_at,
+        "finished_at": now(),
+        "ok": False,
+        "registered_checkouts": 0,
+        "available_checkouts": 0,
+        "sync": [],
+        "hydrate": [],
+        "skipped": [],
+        "failures": [
+            {
+                "phase": phase,
+                "error": sanitize_terminal_text(exc),
+            }
+        ],
+        "central_commit": None,
     }
 
 
@@ -1075,13 +1190,59 @@ def service_install(interval: int) -> dict[str, object]:
         paths[key].parent.mkdir(parents=True, exist_ok=True)
     ensure_store()
     plist = desired_service_plist(interval)
-    if service_is_loaded():
-        run(["launchctl", "bootout", service_domain(), str(paths["plist"])])
-    atomic_write_text(
-        paths["plist"],
-        plistlib.dumps(plist, sort_keys=True).decode("utf-8"),
+    previous_plist = (
+        paths["plist"].read_bytes() if paths["plist"].exists() else None
     )
-    run(["launchctl", "bootstrap", service_domain(), str(paths["plist"])])
+    was_loaded = service_is_loaded()
+    if was_loaded:
+        run(["launchctl", "bootout", service_domain(), str(paths["plist"])])
+    try:
+        atomic_write_text(
+            paths["plist"],
+            plistlib.dumps(plist, sort_keys=True).decode("utf-8"),
+        )
+        run(["launchctl", "bootstrap", service_domain(), str(paths["plist"])])
+    except (PceError, OSError) as exc:
+        rollback_errors: list[str] = []
+        restored_plist = False
+        try:
+            if previous_plist is None:
+                if paths["plist"].exists():
+                    paths["plist"].unlink()
+                    fsync_parent(paths["plist"])
+            else:
+                atomic_write_bytes(paths["plist"], previous_plist)
+                restored_plist = True
+        except (PceError, OSError) as rollback_exc:
+            rollback_errors.append(
+                f"could not restore the previous plist: {sanitize_terminal_text(rollback_exc)}"
+            )
+
+        if was_loaded:
+            if previous_plist is None:
+                rollback_errors.append(
+                    "could not reload the previous service because its plist was missing"
+                )
+            elif restored_plist:
+                try:
+                    run(
+                        [
+                            "launchctl",
+                            "bootstrap",
+                            service_domain(),
+                            str(paths["plist"]),
+                        ]
+                    )
+                except (PceError, OSError) as rollback_exc:
+                    rollback_errors.append(
+                        "could not reload the previous service: "
+                        f"{sanitize_terminal_text(rollback_exc)}"
+                    )
+
+        message = sanitize_terminal_text(exc)
+        if rollback_errors:
+            message += "; service rollback failed: " + "; ".join(rollback_errors)
+        raise PceError(message) from exc
     return {
         "installed": True,
         "loaded": service_is_loaded(),
@@ -1389,8 +1550,8 @@ def discover_init_candidate(
             unique.setdefault(str(repo), repo)
         if not unique:
             raise PceError("select at least one Git checkout")
-        if str(selected) in unique:
-            raise PceError("knowledge store must not also be a product checkout")
+        for repo in unique.values():
+            validate_checkout_setup(repo, selected)
         planned_hashes: dict[Path, str] = {}
         checkouts = tuple(
             _discover_checkout_candidate_resolved(repo, planned_hashes)
@@ -1622,6 +1783,7 @@ def _setup_changed(
 def _verify_checkout_inputs(reviewed: InitCheckoutCandidate) -> None:
     """Reject changes to reviewed local inputs immediately before mutation."""
 
+    validate_checkout_setup(Path(reviewed.repository))
     checks = (
         (Path(reviewed.config_path), reviewed._config_fingerprint),
         (Path(reviewed.exclude_path), reviewed._exclude_fingerprint),
@@ -2029,6 +2191,7 @@ def _publish_init_candidate_selected(candidate: InitCandidate) -> dict[str, obje
 
 
 def setup_repo(repo: Path) -> dict[str, object]:
+    validate_checkout_setup(repo)
     ensure_store()
     ns, meta = namespace(repo)
     ns.mkdir(parents=True, exist_ok=True)
@@ -2111,19 +2274,18 @@ def doctor(repo: Path) -> dict[str, object]:
     exclude_path = git_exclude_path(repo)
     exclude = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
     missing_excludes = list(missing_exclude_entries(exclude))
-    visible = git(repo, "status", "--short", "--untracked-files=all")
-    visible_ce = [
-        line
-        for line in visible.splitlines()
-        if any(
-            marker in line
-            for marker in (
-                LOCAL_ROOT_NAME,
-                ".compound-engineering/config.local.yaml",
-                "CONCEPTS.md",
-            )
-        )
-    ]
+    managed_paths = [LOCAL_ROOT_NAME, ".compound-engineering/config.local.yaml"]
+    if not is_tracked(repo, "CONCEPTS.md"):
+        managed_paths.append("CONCEPTS.md")
+    visible = git(
+        repo,
+        "status",
+        "--short",
+        "--untracked-files=all",
+        "--",
+        *managed_paths,
+    )
+    visible_ce = visible.splitlines()
     namespace_exists = ns.exists()
     docs_root_valid = docs_root_lines == [f"docs_root: {LOCAL_ROOT_NAME}"]
     return {
@@ -2377,6 +2539,21 @@ def search_store(repo: Path | None, query: list[str], limit: int) -> dict[str, o
 
 def print_result(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def json_error(code: str, message: object) -> dict[str, object]:
+    return {
+        "ok": False,
+        "error": code,
+        "message": sanitize_terminal_text(message),
+    }
+
+
+def json_requested(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "global_json", False)
+        or getattr(args, "local_json", False)
+    )
 
 
 def present_result(
@@ -2662,18 +2839,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "service" and args.service_command is None:
         args.selected_help_parser.print_help()
         return 0
+    sync_all_started_at = now() if args.command == "sync-all" else None
     try:
         if args.command == "init":
-            json_requested = bool(args.global_json or args.local_json)
-            if json_requested:
+            if json_requested(args):
                 print_result(
-                    {
-                        "error": "interactive_required",
-                        "message": (
+                    json_error(
+                        "interactive_required",
+                        (
                             "pce init is interactive; use pce setup --repo <path> "
                             "for non-interactive setup"
                         ),
-                    }
+                    )
                 )
                 return 2
             if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -2723,11 +2900,18 @@ def main(argv: list[str] | None = None) -> int:
             present_result(f"service {args.service_command}", result, args)
             return 0
 
+        setup_repositories: list[Path] | None = None
+        if args.command == "setup":
+            setup_repositories = [resolve_repo(raw) for raw in args.repo]
+            for repository in setup_repositories:
+                validate_checkout_setup(repository)
+
         exit_code = 0
         should_present = True
         with store_lock():
             if args.command == "setup":
-                values = [setup_repo(resolve_repo(raw)) for raw in args.repo]
+                assert setup_repositories is not None
+                values = [setup_repo(repository) for repository in setup_repositories]
                 result: dict[str, object] = {"checkouts": values}
                 if args.commit:
                     result["central_commit"] = commit_store(
@@ -2795,7 +2979,26 @@ def main(argv: list[str] | None = None) -> int:
             present_result(args.command, result, args)
         return exit_code
     except PceError as exc:
-        print(f"error: {sanitize_terminal_text(exc)}", file=sys.stderr)
+        message = sanitize_terminal_text(exc)
+        if (
+            args.command == "sync-all"
+            and args.status_file is not None
+            and sync_all_started_at is not None
+        ):
+            try:
+                write_json(
+                    args.status_file.expanduser().resolve(),
+                    automatic_sync_failure(sync_all_started_at, "sync-all", exc),
+                )
+            except OSError as status_exc:
+                message += (
+                    "; could not update status file: "
+                    f"{sanitize_terminal_text(status_exc)}"
+                )
+        if json_requested(args):
+            print_result(json_error("pce_error", message))
+        else:
+            print(f"error: {message}", file=sys.stderr)
         return 2
 
 
