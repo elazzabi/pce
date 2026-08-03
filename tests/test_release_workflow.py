@@ -76,6 +76,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("    if: github.event_name == 'push'\n", block)
         self.assertIn("    needs: [validate, draft]\n", block)
         self.assertIn("os: [ubuntu-24.04, macos-15]", block)
+        self.assertIn("contents: write", block)
         self.assertIn("ref: ${{ needs.validate.outputs.source-revision }}", block)
         self.assertIn("RELEASE_ID: ${{ needs.draft.outputs.release-id }}", block)
         self.assertIn('releases/$RELEASE_ID/assets?per_page=100', block)

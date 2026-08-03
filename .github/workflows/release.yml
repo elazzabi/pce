@@ -202,7 +202,8 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
+      # GitHub requires write scope to download assets from an unpublished release.
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
