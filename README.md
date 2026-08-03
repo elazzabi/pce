@@ -3,17 +3,21 @@
 PCE keeps private Compound Engineering plans and learnings in one Git-versioned
 knowledge store while materializing the relevant namespace into selected product
 checkouts. The CLI source and installed program are separate from that private
-data.
+data. PCE is distributed through versioned GitHub Releases; the private
+knowledge store is never part of a release.
 
-This repository is currently a private-preview source checkout. Its installer
-uses only local files; it does not download a release or publish anything.
+## Install
 
-## Install from this checkout
-
-From this PCE source checkout, run:
+Install the latest stable release with one command:
 
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/elazzabi/pce/main/install.sh | sh
+```
+
+Install an exact version with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/elazzabi/pce/main/install.sh | sh -s -- --version 0.1.0
 ```
 
 The default prefix is `~/.local`. Ensure `~/.local/bin` is on `PATH`, then
@@ -23,11 +27,22 @@ verify the active program:
 pce --version
 ```
 
-To use another prefix:
+Pass `--prefix PATH` after `sh -s --` to use another prefix:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/elazzabi/pce/main/install.sh | sh -s -- --prefix /path/to/prefix
+```
+
+For development, running the checked-out installer installs directly from local
+source:
 
 ```sh
 ./install.sh --prefix /path/to/prefix
 ```
+
+The release installer downloads a small platform-independent Python archive,
+verifies its declared size and SHA-256 digest, rejects unexpected archive
+contents, and only then activates the version. Python 3 and `curl` are required.
 
 The installer creates this program-only layout:
 
@@ -109,19 +124,43 @@ pce service status
 Service installation is a separate, explicit action. Installing or reinstalling
 the CLI does not load, unload, or rewrite the service.
 
-## Development
+## Development and releases
 
-Run the installer tests:
-
-```sh
-python3 tests/test_install.py
-```
-
-Run the full PCE suite:
+Run all source, installer, release, and workflow tests:
 
 ```sh
+sh -n install.sh
 python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-There is no curl or GitHub Release installer in this preview. Public release
-distribution requires a separately authenticated and verified release design.
+A tag must exactly match the `PCE_VERSION` declared in `scripts/pce.py`. To
+publish `0.1.0`, make sure the release commit is on GitHub, then push its tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag launches `.github/workflows/release.yml`. The workflow validates the
+tag and full commit hash, runs the complete test suite, builds one deterministic
+universal archive plus its manifest and checksums, and creates a draft GitHub
+Release. A clean job then installs that exact draft through the same installer
+path users run. The release is published only after the smoke install succeeds.
+
+Watch the run with:
+
+```sh
+gh run watch
+```
+
+To validate an existing matching tag without creating or publishing a release:
+
+```sh
+gh workflow run release.yml --ref v0.1.0 -f tag=v0.1.0
+```
+
+That manual path builds, downloads, and smoke-installs the candidate from the
+workflow artifact. When a new stable release is published, rerun the install
+command to activate it; existing PCE configuration, services, and knowledge
+data are left untouched.
