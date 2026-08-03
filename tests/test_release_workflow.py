@@ -49,15 +49,25 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
         self.assertIn("    if: github.event_name == 'push'\n", block)
         self.assertIn("    needs: [validate, build]\n", block)
+        self.assertIn("    timeout-minutes: 10\n", block)
         self.assertIn("release-id: ${{ steps.release.outputs.release-id }}", block)
         self.assertIn("gh api --paginate --slurp", block)
+        self.assertIn('releases.json\" || return \"$?\"', block)
         self.assertIn("if len(matches) > 1:", block)
         self.assertIn("if release.get(\"draft\") is not True:", block)
-        self.assertIn("release.get(\"target_commitish\") != sys.argv[3]", block)
-        self.assertIn('gh release create "$RELEASE_TAG" \\', block)
-        self.assertIn("--draft \\", block)
-        self.assertIn('--target "$SOURCE_REVISION"', block)
-        self.assertIn('gh release upload "$RELEASE_TAG"', block)
+        self.assertIn("release.get(\"target_commitish\") != sys.argv[4]", block)
+        self.assertIn('gh api --method POST "/repos/$GH_REPO/releases" \\', block)
+        self.assertIn('-f target_commitish="$SOURCE_REVISION" \\', block)
+        self.assertIn('-F draft=true \\', block)
+        self.assertIn('release_id="$(release_id_from_json', block)
+        self.assertIn('gh api --method DELETE "/repos/$GH_REPO/releases/assets/$asset_id"', block)
+        self.assertIn('releases/$release_id/assets?name=$asset_name', block)
+        self.assertNotIn("wait_for_release", block)
+        self.assertNotIn('gh release upload "$RELEASE_TAG"', block)
+        self.assertLess(
+            block.index('release_id="$(release_id_from_json'),
+            block.index('releases/$release_id/assets?name=$asset_name'),
+        )
         self.assertIn('echo "release-id=$release_id"', block)
 
     def test_tag_smoke_downloads_the_pinned_draft_on_both_platforms(self) -> None:
