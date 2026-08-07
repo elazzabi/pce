@@ -959,6 +959,66 @@ def commit_store(message: str, paths: Iterable[Path]) -> dict[str, object]:
     }
 
 
+def commit_prepared_store(
+    message: str,
+    paths: Iterable[Path],
+) -> dict[str, object]:
+    """Commit already-staged paths without refreshing them from the worktree."""
+
+    root = ensure_store()
+    relative_paths = sorted(
+        {
+            path.resolve().relative_to(root).as_posix()
+            for path in paths
+        }
+    )
+    if not relative_paths:
+        raise PceError("prepared central commit has no paths")
+
+    changed_after_staging = run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--quiet",
+            "--",
+            *relative_paths,
+        ],
+        check=False,
+    )
+    if changed_after_staging.returncode != 0:
+        raise PceError(
+            "prepared central transaction changed after it was staged; "
+            "restore the staged content before retrying"
+        )
+
+    result = run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "commit",
+            "-m",
+            message,
+            "--only",
+            "--",
+            *relative_paths,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise PceError(
+            f"central commit failed; changes remain staged in {root}: {detail}"
+        )
+    return {
+        "committed": True,
+        "commit": git(root, "rev-parse", "--short", "HEAD"),
+        "message": message,
+    }
+
+
 def registered_checkouts() -> list[tuple[Path, str]]:
     projects = ensure_store() / "projects"
     result: list[tuple[Path, str]] = []
@@ -2331,9 +2391,124 @@ def project_state(ns: Path) -> tuple[Path, dict[str, object]]:
     return path, data
 
 
+def _staged_paths(root: Path, pathspec: str) -> set[str]:
+    return {
+        item
+        for item in git(
+            root,
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--",
+            pathspec,
+        ).split("\0")
+        if item
+    }
+
+
+def staged_harvest_transaction(
+    repo: Path,
+) -> dict[str, object] | None:
+    """Return and validate the namespace's staged harvest transaction."""
+
+    root = store_root()
+    if not (root / ".git").exists():
+        return None
+    ns, meta = namespace(repo)
+    namespace_rel = ns.resolve().relative_to(root).as_posix()
+    state_path = ns / "state.json"
+    state_rel = state_path.resolve().relative_to(root).as_posix()
+    staged = _staged_paths(root, namespace_rel)
+    if not staged:
+        return None
+    if state_rel not in staged:
+        raise PceError(
+            "staged namespace changes do not form a recoverable harvest "
+            "transaction because state.json is not staged; commit or remove "
+            "these staged paths before selecting another batch: "
+            + ", ".join(sorted(staged))
+        )
+
+    try:
+        staged_state = json.loads(git(root, "show", f":{state_rel}"))
+    except (json.JSONDecodeError, PceError) as exc:
+        raise PceError(
+            "unresolved staged harvest transaction has invalid state; "
+            f"repair the staged {state_rel} before retrying: {exc}"
+        ) from exc
+    if not isinstance(staged_state, dict):
+        raise PceError(
+            "unresolved staged harvest transaction state is not an object; "
+            f"repair the staged {state_rel} before retrying"
+        )
+
+    revision = staged_state.get("last_harvested_revision")
+    review = staged_state.get("last_harvest_review")
+    if not isinstance(revision, str) or not revision:
+        raise PceError(
+            "unresolved staged harvest transaction has no revision; "
+            f"repair the staged {state_rel} before retrying"
+        )
+    if not isinstance(review, str) or not review:
+        raise PceError(
+            "unresolved staged harvest transaction has no stored review; "
+            f"repair the staged {state_rel} before retrying"
+        )
+
+    review_path = (ns / review).resolve()
+    try:
+        review_namespace_rel = review_path.relative_to(ns.resolve())
+    except ValueError as exc:
+        raise PceError(
+            "unresolved staged harvest transaction references a review outside "
+            f"its namespace: {review}"
+        ) from exc
+    if (
+        not review_namespace_rel.parts
+        or review_namespace_rel.parts[0] != "harvest-reviews"
+    ):
+        raise PceError(
+            "unresolved staged harvest transaction references an invalid review "
+            f"path: {review}"
+        )
+
+    review_rel = review_path.relative_to(root).as_posix()
+    expected = {state_rel, review_rel}
+    unrelated = sorted(staged - expected)
+    if unrelated:
+        raise PceError(
+            "unresolved staged harvest transaction has unrelated staged namespace "
+            "changes; resolve them before retrying: "
+            + ", ".join(unrelated)
+        )
+    if review_rel not in staged or not review_path.is_file():
+        raise PceError(
+            "stored harvest review is missing from the unresolved staged "
+            f"transaction: {review_path}"
+        )
+
+    return {
+        "repository": str(repo),
+        "key": meta["key"],
+        "revision": revision,
+        "review": review,
+        "review_path": str(review_path),
+        "state_path": str(state_path),
+        "paths": [str(state_path), str(review_path)],
+    }
+
+
 def harvest(repo: Path, limit: int) -> dict[str, object]:
     if limit < 1:
         raise PceError("harvest limit must be at least 1")
+    pending = staged_harvest_transaction(repo)
+    if pending is not None:
+        raise PceError(
+            "unresolved staged harvest transaction for revision "
+            f"{pending['revision']}; retry pce harvest-mark --revision "
+            f"{pending['revision']} --commit before selecting another batch"
+        )
     ns, meta = namespace(repo)
     state_path_value, state = project_state(ns)
     upstream = default_upstream_ref(repo)
@@ -2471,6 +2646,71 @@ def harvest_mark(
         "review": stored_review,
         "state_path": str(path),
     }
+
+
+def harvest_mark_and_commit(
+    repo: Path,
+    revision: str,
+    review_file: Path,
+) -> dict[str, object]:
+    """Create or retry one fail-closed harvest watermark transaction."""
+
+    ns, meta = namespace(repo)
+    resolved = git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    message = f"chore({meta['key']}): advance harvest watermark"
+    pending = staged_harvest_transaction(repo)
+    if pending is not None:
+        if pending["revision"] != resolved:
+            raise PceError(
+                "harvest retry revision does not match the unresolved staged "
+                f"transaction: requested {resolved}, staged {pending['revision']}"
+            )
+        central_commit = commit_prepared_store(
+            message,
+            [Path(path) for path in pending["paths"]],
+        )
+        central_commit["retried"] = True
+        return {
+            "repository": str(repo),
+            "key": meta["key"],
+            "revision": resolved,
+            "review": pending["review"],
+            "state_path": pending["state_path"],
+            "central_commit": central_commit,
+        }
+
+    root = ensure_store()
+    namespace_rel = ns.resolve().relative_to(root).as_posix()
+    namespace_status = git(
+        root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--",
+        namespace_rel,
+    )
+    if namespace_status:
+        raise PceError(
+            "harvest namespace has uncommitted changes; sync or commit them before "
+            "starting a new watermark transaction"
+        )
+
+    result = harvest_mark(repo, resolved, review_file)
+    stored_review = result.get("review")
+    if not isinstance(stored_review, str) or not stored_review:
+        raise PceError("harvest watermark transaction did not store its review")
+    transaction_paths = [Path(str(result["state_path"])), ns / stored_review]
+    relative_paths = [
+        path.resolve().relative_to(root).as_posix() for path in transaction_paths
+    ]
+    git(root, "add", "--all", "--", *relative_paths)
+    pending = staged_harvest_transaction(repo)
+    if pending is None:
+        raise PceError("harvest watermark transaction was not staged")
+    central_commit = commit_prepared_store(message, transaction_paths)
+    central_commit["retried"] = False
+    result["central_commit"] = central_commit
+    return result
 
 
 def inventory(repo: Path | None) -> dict[str, object]:
@@ -2963,15 +3203,17 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.command == "harvest":
                     result = harvest(repo, args.limit)
                 elif args.command == "harvest-mark":
-                    result = harvest_mark(
-                        repo,
-                        args.revision,
-                        Path(args.review_file),
-                    )
                     if args.commit:
-                        result["central_commit"] = commit_store(
-                            f"chore({result['key']}): advance harvest watermark",
-                            [namespace(repo)[0]],
+                        result = harvest_mark_and_commit(
+                            repo,
+                            args.revision,
+                            Path(args.review_file),
+                        )
+                    else:
+                        result = harvest_mark(
+                            repo,
+                            args.revision,
+                            Path(args.review_file),
                         )
                 elif args.command == "search":
                     result = search_store(repo, args.terms, args.limit)
