@@ -119,38 +119,22 @@ and pending inbox items.
 
 ## Harvest work by others
 
-Run:
+Before setup or hydration, confirm that the calling environment exposes both
+`compound-engineering:ce-compound` and
+`compound-engineering:ce-compound-refresh`. Then read
+`references/harvest-workflow.md` completely and follow its protocol.
 
-```bash
-pce harvest --repo <checkout> --json
-```
+Binding invariants:
 
-Analyze the returned first-parent commits using the final diff, tests, PR body,
-linked issue/design material, and reviews when available. Classify each as:
-
-- no knowledge action;
-- refresh an existing learning;
-- new repo-specific candidate;
-- portable-library candidate.
-
-Do not run `ce-compound` blindly over commit messages. Mark the harvest
-watermark only after writing a Markdown review that records each commit,
-classification, evidence inspected, and any capture or refresh performed:
-
-```bash
-pce harvest-mark \
-  --repo <checkout> \
-  --revision <safe_mark_revision> \
-  --review-file <review.md> \
-  --commit \
-  --json
-```
-
-The review is copied into the project namespace before the watermark advances,
-so “no knowledge action” decisions remain auditable too.
-
-When `truncated` is true, process another harvest batch after marking
-`safe_mark_revision`; do not jump directly to `current_revision`.
+- PCE selects commits and records progress deterministically; the calling agent
+  performs the semantic review.
+- Every's CE skills own learning schema and paths. Never invent a PCE learning
+  template or treat a harvest audit as a solution.
+- PCE-owned reviews stay in `harvest-reviews/`, separate from CE learnings.
+- Fail closed at the first incomplete commit and never advance an initial
+  baseline partially.
+- A pending harvest transaction permits only the reference's same-revision
+  retry; it never permits selection of a new batch.
 
 ## Conflict behavior
 
