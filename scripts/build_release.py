@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PAYLOAD = (
     "SKILL.md",
+    "references/harvest-workflow.md",
     "references/storage-model.md",
     "scripts/pce.py",
     "scripts/pce_ui.py",

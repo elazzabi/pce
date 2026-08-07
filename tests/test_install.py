@@ -273,11 +273,13 @@ printf '%s\\n' private-test-token
             ),
             [
                 "SKILL.md",
+                "references/harvest-workflow.md",
                 "references/storage-model.md",
                 "scripts/pce.py",
                 "scripts/pce_ui.py",
             ],
         )
+        self.assertTrue((skill / "references" / "harvest-workflow.md").is_file())
         smoke = subprocess.run(
             [str(executable), "--version"],
             cwd=self.root,
@@ -498,6 +500,27 @@ printf '%s\\n' private-test-token
         self.assertEqual(version.stat().st_ino, first_stat.st_ino)
         self.assertEqual(version.stat().st_mtime_ns, first_stat.st_mtime_ns)
 
+    def test_refuses_same_version_content_drift(self) -> None:
+        first = self.run_installer()
+        workflow = (
+            self.prefix
+            / "lib"
+            / "pce"
+            / "versions"
+            / VERSION
+            / "references"
+            / "harvest-workflow.md"
+        )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        workflow.write_text("locally changed\n", encoding="utf-8")
+
+        second = self.run_installer()
+
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("differs", second.stderr)
+        self.assertEqual(workflow.read_text(encoding="utf-8"), "locally changed\n")
+
     def test_repeat_tolerates_runtime_bytecode(self) -> None:
         first = self.run_installer()
         executable = self.prefix / "bin" / "pce"
@@ -525,7 +548,7 @@ printf '%s\\n' private-test-token
         self.assertIn("already current", second.stdout)
 
     def test_upgrades_a_validated_managed_install(self) -> None:
-        previous_version = "0.0.9"
+        previous_version = "0.1.0"
         managed = self.prefix / "lib" / "pce"
         previous_root = managed / "versions" / previous_version
         for relative in (
@@ -561,6 +584,10 @@ printf '%s\\n' private-test-token
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(os.readlink(managed / "current"), f"versions/{VERSION}")
         self.assertTrue((managed / "versions" / VERSION / "scripts" / "pce.py").is_file())
+        self.assertTrue(
+            (managed / "versions" / VERSION / "references" / "harvest-workflow.md").is_file()
+        )
+        self.assertFalse((previous_root / "references" / "harvest-workflow.md").exists())
         self.assertIn(f'PCE_VERSION = "{previous_version}"', previous_program.read_text())
 
     def test_refuses_occupied_executable_without_overwriting(self) -> None:

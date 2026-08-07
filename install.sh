@@ -11,6 +11,11 @@ RELEASE_BASE_URL_EXPLICIT=${PCE_RELEASE_BASE_URL+x}
 RELEASES_URL=${PCE_RELEASE_BASE_URL:-https://github.com/elazzabi/pce/releases}
 GITHUB_API_URL=${PCE_GITHUB_API_URL:-https://api.github.com/repos/elazzabi/pce}
 PAYLOAD_FILES='SKILL.md
+references/harvest-workflow.md
+references/storage-model.md
+scripts/pce.py
+scripts/pce_ui.py'
+PCE_0_1_PAYLOAD_FILES='SKILL.md
 references/storage-model.md
 scripts/pce.py
 scripts/pce_ui.py'
@@ -55,13 +60,20 @@ validate_version_tree() {
   expected_version=$2
   compare_with_source=$3
   mismatch_message="refusing to replace an existing PCE version that differs: $version_root"
+  version_payload_files=$PAYLOAD_FILES
+  legacy_payload=0
+
+  if [ "$compare_with_source" -eq 0 ] && [ "$expected_version" = 0.1.0 ]; then
+    version_payload_files=$PCE_0_1_PAYLOAD_FILES
+    legacy_payload=1
+  fi
 
   [ -d "$version_root" ] && [ ! -L "$version_root" ] || fail "$mismatch_message"
   for relative in $PAYLOAD_DIRECTORIES; do
     [ -d "$version_root/$relative" ] && [ ! -L "$version_root/$relative" ] ||
       fail "$mismatch_message"
   done
-  for relative in $PAYLOAD_FILES; do
+  for relative in $version_payload_files; do
     [ -f "$version_root/$relative" ] && [ ! -L "$version_root/$relative" ] ||
       fail "$mismatch_message"
   done
@@ -70,6 +82,7 @@ validate_version_tree() {
     ! -path "$version_root" \
     ! -path "$version_root/SKILL.md" \
     ! -path "$version_root/references" \
+    ! -path "$version_root/references/harvest-workflow.md" \
     ! -path "$version_root/references/storage-model.md" \
     ! -path "$version_root/scripts" \
     ! -path "$version_root/scripts/pce.py" \
@@ -78,6 +91,9 @@ validate_version_tree() {
     ! -path "$version_root/scripts/__pycache__/*" \
     -print -quit) || fail "$mismatch_message"
   [ -z "$unexpected_entry" ] || fail "$mismatch_message"
+  if [ "$legacy_payload" -eq 1 ] && path_exists "$version_root/references/harvest-workflow.md"; then
+    fail "$mismatch_message"
+  fi
 
   bytecode_root=$version_root/scripts/__pycache__
   if path_exists "$bytecode_root"; then
