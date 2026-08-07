@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/elazzabi/pce/main/install.sh | sh
 Install an exact version with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/elazzabi/pce/main/install.sh | sh -s -- --version 0.2.0
+curl -fsSL https://raw.githubusercontent.com/elazzabi/pce/main/install.sh | sh -s -- --version 0.2.1
 ```
 
 The default prefix is `~/.local`. Ensure `~/.local/bin` is on `PATH`, then
@@ -50,8 +50,8 @@ The installer creates this program-only layout:
 ~/.local/
 ├── bin/pce -> ../lib/pce/current/scripts/pce.py
 └── lib/pce/
-    ├── current -> versions/0.2.0
-    └── versions/0.2.0/
+    ├── current -> versions/0.2.1
+    └── versions/0.2.1/
         ├── SKILL.md
         ├── references/{harvest-workflow.md,storage-model.md}
         └── scripts/{pce.py,pce_ui.py}
@@ -135,11 +135,11 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 A tag must exactly match the `PCE_VERSION` declared in `scripts/pce.py`. To
-publish `0.2.0`, make sure the release commit is on GitHub, then push its tag:
+publish `0.2.1`, make sure the release commit is on GitHub, then push its tag:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 The tag launches `.github/workflows/release.yml`. The workflow validates the
@@ -157,7 +157,7 @@ gh run watch
 To validate an existing matching tag without creating or publishing a release:
 
 ```sh
-gh workflow run release.yml --ref v0.2.0 -f tag=v0.2.0
+gh workflow run release.yml --ref v0.2.1 -f tag=v0.2.1
 ```
 
 That manual path builds, downloads, and smoke-installs the candidate from the

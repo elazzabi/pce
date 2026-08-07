@@ -39,7 +39,7 @@ from pce_ui import (  # noqa: E402
     select_output_mode,
 )
 
-PCE_VERSION = "0.2.0"
+PCE_VERSION = "0.2.1"
 
 STORE_ENV = "PERSONAL_COMPOUND_HOME"
 CONFIG_HOME_ENV = "PERSONAL_COMPOUND_CONFIG_HOME"
