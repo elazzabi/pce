@@ -2208,6 +2208,14 @@ class PersonalCompoundTest(unittest.TestCase):
         history.write_text("ready\n", encoding="utf-8")
         git(self.repo_a, "add", "first-harvest.txt")
         git(self.repo_a, "commit", "-m", "test: first harvest")
+        pce.ensure_store()
+        git(pce.store_root(), "config", "user.name", "Personal Compound Test")
+        git(
+            pce.store_root(),
+            "config",
+            "user.email",
+            "personal-compound@example.test",
+        )
 
         setup = subprocess.run(
             [
