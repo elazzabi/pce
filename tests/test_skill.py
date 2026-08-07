@@ -37,11 +37,15 @@ class HarvestSkillContractTest(unittest.TestCase):
         self.assert_in_order(
             "compound-engineering:ce-compound",
             "compound-engineering:ce-compound-refresh",
-            "pce setup --repo <checkout> --json",
+            "pce setup --repo <checkout> --commit --json",
             "pce hydrate --repo <checkout> --json",
         )
         self.assertIn("fail closed", self.workflow.lower())
         self.assertIn("before any repository mutation", self.workflow.lower())
+        self.assertIn("setup's `central_commit`", self.workflow.lower())
+        self.assertRegex(
+            self.workflow.lower(), r"first-time batch needs no\s+ce\s+action"
+        )
 
     def test_selection_is_explicit_bounded_and_pinned(self) -> None:
         self.assertIn("pce harvest --repo <checkout> --limit 5 --json", self.workflow)

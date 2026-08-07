@@ -2196,11 +2196,53 @@ class PersonalCompoundTest(unittest.TestCase):
         self.assertEqual(result["revision"], revisions[1])
         self.assertTrue(result["central_commit"]["committed"])
         self.assertFalse(result["central_commit"]["retried"])
+        self.assertFalse(result["central_commit"]["already_committed"])
         self.assertEqual(len(list((ns / "harvest-reviews").iterdir())), 1)
         self.assertEqual(
             git_output(pce.store_root(), "diff", "--cached", "--name-only"),
             "",
         )
+
+    def test_setup_commit_allows_first_no_action_harvest_to_commit(self) -> None:
+        history = self.repo_a / "first-harvest.txt"
+        history.write_text("ready\n", encoding="utf-8")
+        git(self.repo_a, "add", "first-harvest.txt")
+        git(self.repo_a, "commit", "-m", "test: first harvest")
+
+        setup = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "setup",
+                "--repo",
+                str(self.repo_a),
+                "--commit",
+                "--json",
+            ],
+            env=os.environ.copy(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        setup_result = json.loads(setup.stdout)
+        self.assertTrue(setup_result["central_commit"]["committed"])
+
+        selected = pce.harvest(self.repo_a, 5)
+        review = self.root / "no-action-review.md"
+        review.write_text(
+            "# Harvest review\n\nClassification: no knowledge action.\n",
+            encoding="utf-8",
+        )
+        marked = pce.harvest_mark_and_commit(
+            self.repo_a,
+            str(selected["safe_mark_revision"]),
+            review,
+        )
+
+        self.assertTrue(marked["central_commit"]["committed"])
+        ns, _ = pce.namespace(self.repo_a)
+        self.assertEqual(pce.namespace_store_status(ns), "")
 
     def test_failed_harvest_commit_blocks_selection_and_retries_once(self) -> None:
         revisions, review, ns = self.leave_failed_harvest_transaction()
@@ -2223,6 +2265,136 @@ class PersonalCompoundTest(unittest.TestCase):
         self.assertEqual(result["revision"], revisions[1])
         self.assertTrue(result["central_commit"]["committed"])
         self.assertTrue(result["central_commit"]["retried"])
+        self.assertFalse(result["central_commit"]["already_committed"])
+        self.assertEqual(len(list((ns / "harvest-reviews").iterdir())), 1)
+
+    def test_harvest_rejects_dirty_watermark_after_staging_failure(self) -> None:
+        revisions, review, ns = self.prepare_harvest_transaction()
+        real_git = pce.git
+
+        def fail_transaction_add(
+            repo: Path,
+            *args: str,
+            check: bool = True,
+        ) -> str:
+            if repo == pce.store_root() and args[:1] == ("add",):
+                raise pce.PceError("simulated staging failure")
+            return real_git(repo, *args, check=check)
+
+        with patch.object(pce, "git", side_effect=fail_transaction_add):
+            with self.assertRaisesRegex(pce.PceError, "simulated staging failure"):
+                pce.harvest_mark_and_commit(self.repo_a, revisions[1], review)
+
+        self.assertEqual(
+            git_output(pce.store_root(), "diff", "--cached", "--name-only"),
+            "",
+        )
+        state = pce.read_json(ns / "state.json", {})
+        self.assertEqual(state["last_harvested_revision"], revisions[1])
+        with self.assertRaisesRegex(pce.PceError, "uncommitted changes"):
+            pce.harvest(self.repo_a, 2)
+
+    def test_sync_commit_preserves_a_staged_harvest_transaction(self) -> None:
+        revisions, review, ns = self.leave_failed_harvest_transaction()
+        staged_before = git_output(
+            pce.store_root(), "diff", "--cached", "--name-only"
+        )
+        self.write_artifact(self.repo_a, "solutions/later.md", "sync later\n")
+
+        synced = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "sync",
+                "--repo",
+                str(self.repo_a),
+                "--commit",
+                "--json",
+            ],
+            env=os.environ.copy(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(synced.returncode, 0)
+        self.assertIn(
+            "would absorb an unresolved staged harvest",
+            synced.stdout + synced.stderr,
+        )
+        self.assertEqual(
+            git_output(pce.store_root(), "diff", "--cached", "--name-only"),
+            staged_before,
+        )
+        review.unlink()
+        retried = pce.harvest_mark_and_commit(self.repo_a, revisions[1], review)
+        self.assertTrue(retried["central_commit"]["committed"])
+        self.assertTrue(retried["central_commit"]["retried"])
+        self.assertEqual(len(list((ns / "harvest-reviews").iterdir())), 1)
+
+    def test_automatic_sync_isolates_a_staged_harvest_transaction(self) -> None:
+        revisions, review, ns = self.leave_failed_harvest_transaction()
+        staged_before = git_output(
+            pce.store_root(), "diff", "--cached", "--name-only"
+        )
+        other = self.make_repo("other-project")
+        git(
+            other,
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Example/Other-Project.git",
+        )
+        pce.setup_repo(other)
+        other_ns, _ = pce.namespace(other)
+        pce.commit_store("knowledge: initialize other project", [other_ns])
+        self.write_artifact(self.repo_a, "solutions/deferred.md", "deferred\n")
+        self.write_artifact(other, "solutions/synced.md", "synced\n")
+
+        result = pce.automatic_sync(commit=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(
+                failure["phase"] == "commit"
+                and failure.get("repository") == str(self.repo_a.resolve())
+                and "staged harvest transaction" in failure["error"]
+                for failure in result["failures"]
+            )
+        )
+        self.assertTrue(result["central_commit"]["committed"])
+        self.assertFalse((ns / "artifacts" / "solutions/deferred.md").exists())
+        self.assertEqual(
+            (other_ns / "artifacts" / "solutions/synced.md").read_text(
+                encoding="utf-8"
+            ),
+            "synced\n",
+        )
+        self.assertEqual(
+            git_output(pce.store_root(), "diff", "--cached", "--name-only"),
+            staged_before,
+        )
+        review.unlink()
+        retried = pce.harvest_mark_and_commit(self.repo_a, revisions[1], review)
+        self.assertTrue(retried["central_commit"]["committed"])
+
+    def test_harvest_retry_is_idempotent_after_lost_acknowledgement(self) -> None:
+        revisions, review, ns = self.prepare_harvest_transaction()
+        completed = pce.harvest_mark_and_commit(self.repo_a, revisions[1], review)
+        committed_head = git_output(pce.store_root(), "rev-parse", "HEAD")
+        stored_review = completed["review"]
+        review.unlink()
+
+        retried = pce.harvest_mark_and_commit(self.repo_a, revisions[1], review)
+
+        self.assertEqual(
+            git_output(pce.store_root(), "rev-parse", "HEAD"),
+            committed_head,
+        )
+        self.assertEqual(retried["review"], stored_review)
+        self.assertTrue(retried["central_commit"]["committed"])
+        self.assertTrue(retried["central_commit"]["retried"])
+        self.assertTrue(retried["central_commit"]["already_committed"])
         self.assertEqual(len(list((ns / "harvest-reviews").iterdir())), 1)
 
     def test_harvest_retry_rejects_a_different_revision(self) -> None:

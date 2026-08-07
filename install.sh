@@ -19,6 +19,7 @@ PCE_0_1_PAYLOAD_FILES='SKILL.md
 references/storage-model.md
 scripts/pce.py
 scripts/pce_ui.py'
+SOURCE_PAYLOAD_FILES=$PAYLOAD_FILES
 PAYLOAD_DIRECTORIES='references scripts'
 
 usage() {
@@ -346,6 +347,9 @@ PY
   ARTIFACT_DIGEST=$2
   EXPECTED_VERSION=$3
   ARTIFACT_SIZE=$4
+  if [ "$EXPECTED_VERSION" = 0.1.0 ]; then
+    SOURCE_PAYLOAD_FILES=$PCE_0_1_PAYLOAD_FILES
+  fi
   ARTIFACT_PATH=$TEMPORARY_ROOT/$ARTIFACT_FILENAME
   if [ -n "$RELEASE_METADATA" ]; then
     [ "$METADATA_ARTIFACT_FILENAME" = "$ARTIFACT_FILENAME" ] ||
@@ -377,7 +381,7 @@ PY
   [ "$ACTUAL_DIGEST" = "$ARTIFACT_DIGEST" ] || fail "release artifact SHA-256 mismatch"
   SOURCE_ROOT=$TEMPORARY_ROOT/candidate
   mkdir "$SOURCE_ROOT" || fail "could not stage release artifact"
-  if ! python3 - "$ARTIFACT_PATH" "$SOURCE_ROOT" "$PAYLOAD_FILES" <<'PY'
+  if ! python3 - "$ARTIFACT_PATH" "$SOURCE_ROOT" "$SOURCE_PAYLOAD_FILES" <<'PY'
 import os
 import shutil
 import sys
@@ -414,7 +418,7 @@ else
   GITHUB_AUTH_HEADER_FILE=
 fi
 
-for relative in $PAYLOAD_FILES; do
+for relative in $SOURCE_PAYLOAD_FILES; do
   [ -f "$SOURCE_ROOT/$relative" ] || fail "PCE package is incomplete: $relative"
 done
 
@@ -481,12 +485,12 @@ if ! path_exists "$VERSION_ROOT"; then
     mkdir -p "$STAGE/$relative" ||
       fail "could not prepare the version staging directory"
   done
-  for relative in $PAYLOAD_FILES; do
+  for relative in $SOURCE_PAYLOAD_FILES; do
     cp "$SOURCE_ROOT/$relative" "$STAGE/$relative" ||
       fail "could not copy $relative"
   done
   chmod 755 "$STAGE/scripts/pce.py" || fail "could not make pce executable"
-  for relative in $PAYLOAD_FILES; do
+  for relative in $SOURCE_PAYLOAD_FILES; do
     [ "$relative" = scripts/pce.py ] || chmod 644 "$STAGE/$relative" ||
       fail "could not set program file modes"
   done

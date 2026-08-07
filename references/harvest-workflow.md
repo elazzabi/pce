@@ -29,15 +29,18 @@ or improvise a learning document.
 After preflight succeeds, run these deterministic operations in order:
 
 ```bash
-pce setup --repo <checkout> --json
+pce setup --repo <checkout> --commit --json
 pce hydrate --repo <checkout> --json
 pce status --repo <checkout> --json
 ```
 
-Require successful JSON results. Before semantic work, `status` must report no
-conflict and no unexplained local or central change. Use the returned repository
-key and namespace path as authoritative identifiers; never hardcode the user's
-private-store path.
+Require successful JSON results. Setup's `central_commit` must report either a
+completed commit or `no central changes`; stop on any commit failure. This
+creates a clean transaction boundary even when a first-time batch needs no CE
+action and therefore has no later sync commit. Before semantic work, `status`
+must report no conflict and no unexplained local or central change. Use the
+returned repository key and namespace path as authoritative identifiers; never
+hardcode the user's private-store path.
 
 ## 3. Snapshot the mutation boundaries
 

@@ -25,6 +25,13 @@ VERSION = re.search(
     (ROOT / "scripts" / "pce.py").read_text(encoding="utf-8"),
     re.MULTILINE,
 ).group(1)
+LEGACY_VERSION = "0.1.0"
+LEGACY_PAYLOAD = (
+    "SKILL.md",
+    "references/storage-model.md",
+    "scripts/pce.py",
+    "scripts/pce_ui.py",
+)
 
 
 class QuietSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
@@ -88,9 +95,49 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return output
 
-    def serve_release(self, output: Path):
+    def build_legacy_release(self, *, extra_member: bool = False) -> Path:
+        output = self.root / "legacy-release"
+        output.mkdir()
+        archive = output / f"pce-v{LEGACY_VERSION}.tar.gz"
+        with tarfile.open(archive, "w:gz") as package:
+            for relative in LEGACY_PAYLOAD:
+                contents = (ROOT / relative).read_bytes()
+                if relative == "scripts/pce.py":
+                    contents = contents.replace(
+                        f'PCE_VERSION = "{VERSION}"'.encode(),
+                        f'PCE_VERSION = "{LEGACY_VERSION}"'.encode(),
+                        1,
+                    )
+                member = tarfile.TarInfo(relative)
+                member.mode = 0o755 if relative == "scripts/pce.py" else 0o644
+                member.size = len(contents)
+                package.addfile(member, io.BytesIO(contents))
+            if extra_member:
+                contents = b"unexpected\n"
+                member = tarfile.TarInfo("unexpected.md")
+                member.mode = 0o644
+                member.size = len(contents)
+                package.addfile(member, io.BytesIO(contents))
+
+        manifest = {
+            "schemaVersion": 1,
+            "version": LEGACY_VERSION,
+            "sourceRevision": "b" * 40,
+            "artifact": {
+                "filename": archive.name,
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "size": archive.stat().st_size,
+            },
+        }
+        (output / "release-manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return output
+
+    def serve_release(self, output: Path, version: str = VERSION):
         web_root = self.root / "web"
-        versioned = web_root / "releases" / "download" / f"v{VERSION}"
+        versioned = web_root / "releases" / "download" / f"v{version}"
         latest = web_root / "releases" / "latest" / "download"
         shutil.copytree(output, versioned)
         shutil.copytree(output, latest)
@@ -329,6 +376,52 @@ printf '%s\\n' private-test-token
             ).stdout.strip(),
             f"pce {VERSION}",
         )
+
+    def test_installs_exact_legacy_release_with_legacy_payload(self) -> None:
+        release_url, _ = self.serve_release(
+            self.build_legacy_release(), version=LEGACY_VERSION
+        )
+
+        result = self.run_installer(
+            "--version",
+            LEGACY_VERSION,
+            extra_env={"PCE_RELEASE_BASE_URL": release_url},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        version = self.prefix / "lib" / "pce" / "versions" / LEGACY_VERSION
+        self.assertEqual(
+            sorted(
+                path.relative_to(version).as_posix()
+                for path in version.rglob("*")
+                if path.is_file()
+            ),
+            list(LEGACY_PAYLOAD),
+        )
+        self.assertEqual(
+            subprocess.run(
+                [str(self.prefix / "bin" / "pce"), "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip(),
+            f"pce {LEGACY_VERSION}",
+        )
+
+    def test_refuses_legacy_release_with_extra_payload_member(self) -> None:
+        release_url, _ = self.serve_release(
+            self.build_legacy_release(extra_member=True), version=LEGACY_VERSION
+        )
+
+        result = self.run_installer(
+            "--version",
+            LEGACY_VERSION,
+            extra_env={"PCE_RELEASE_BASE_URL": release_url},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe payload", result.stderr)
+        self.assertFalse((self.prefix / "lib" / "pce").exists())
 
     def test_installs_latest_remote_release(self) -> None:
         release_url, _ = self.serve_release(self.build_release())
