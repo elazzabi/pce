@@ -18,6 +18,7 @@ VERSION = re.search(
 ).group(1)
 PAYLOAD = {
     "SKILL.md",
+    "references/harvest-workflow.md",
     "references/storage-model.md",
     "scripts/pce.py",
     "scripts/pce_ui.py",

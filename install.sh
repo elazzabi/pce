@@ -11,9 +11,15 @@ RELEASE_BASE_URL_EXPLICIT=${PCE_RELEASE_BASE_URL+x}
 RELEASES_URL=${PCE_RELEASE_BASE_URL:-https://github.com/elazzabi/pce/releases}
 GITHUB_API_URL=${PCE_GITHUB_API_URL:-https://api.github.com/repos/elazzabi/pce}
 PAYLOAD_FILES='SKILL.md
+references/harvest-workflow.md
 references/storage-model.md
 scripts/pce.py
 scripts/pce_ui.py'
+PCE_0_1_PAYLOAD_FILES='SKILL.md
+references/storage-model.md
+scripts/pce.py
+scripts/pce_ui.py'
+SOURCE_PAYLOAD_FILES=$PAYLOAD_FILES
 PAYLOAD_DIRECTORIES='references scripts'
 
 usage() {
@@ -55,13 +61,20 @@ validate_version_tree() {
   expected_version=$2
   compare_with_source=$3
   mismatch_message="refusing to replace an existing PCE version that differs: $version_root"
+  version_payload_files=$PAYLOAD_FILES
+  legacy_payload=0
+
+  if [ "$compare_with_source" -eq 0 ] && [ "$expected_version" = 0.1.0 ]; then
+    version_payload_files=$PCE_0_1_PAYLOAD_FILES
+    legacy_payload=1
+  fi
 
   [ -d "$version_root" ] && [ ! -L "$version_root" ] || fail "$mismatch_message"
   for relative in $PAYLOAD_DIRECTORIES; do
     [ -d "$version_root/$relative" ] && [ ! -L "$version_root/$relative" ] ||
       fail "$mismatch_message"
   done
-  for relative in $PAYLOAD_FILES; do
+  for relative in $version_payload_files; do
     [ -f "$version_root/$relative" ] && [ ! -L "$version_root/$relative" ] ||
       fail "$mismatch_message"
   done
@@ -70,6 +83,7 @@ validate_version_tree() {
     ! -path "$version_root" \
     ! -path "$version_root/SKILL.md" \
     ! -path "$version_root/references" \
+    ! -path "$version_root/references/harvest-workflow.md" \
     ! -path "$version_root/references/storage-model.md" \
     ! -path "$version_root/scripts" \
     ! -path "$version_root/scripts/pce.py" \
@@ -78,6 +92,9 @@ validate_version_tree() {
     ! -path "$version_root/scripts/__pycache__/*" \
     -print -quit) || fail "$mismatch_message"
   [ -z "$unexpected_entry" ] || fail "$mismatch_message"
+  if [ "$legacy_payload" -eq 1 ] && path_exists "$version_root/references/harvest-workflow.md"; then
+    fail "$mismatch_message"
+  fi
 
   bytecode_root=$version_root/scripts/__pycache__
   if path_exists "$bytecode_root"; then
@@ -330,6 +347,9 @@ PY
   ARTIFACT_DIGEST=$2
   EXPECTED_VERSION=$3
   ARTIFACT_SIZE=$4
+  if [ "$EXPECTED_VERSION" = 0.1.0 ]; then
+    SOURCE_PAYLOAD_FILES=$PCE_0_1_PAYLOAD_FILES
+  fi
   ARTIFACT_PATH=$TEMPORARY_ROOT/$ARTIFACT_FILENAME
   if [ -n "$RELEASE_METADATA" ]; then
     [ "$METADATA_ARTIFACT_FILENAME" = "$ARTIFACT_FILENAME" ] ||
@@ -361,7 +381,7 @@ PY
   [ "$ACTUAL_DIGEST" = "$ARTIFACT_DIGEST" ] || fail "release artifact SHA-256 mismatch"
   SOURCE_ROOT=$TEMPORARY_ROOT/candidate
   mkdir "$SOURCE_ROOT" || fail "could not stage release artifact"
-  if ! python3 - "$ARTIFACT_PATH" "$SOURCE_ROOT" "$PAYLOAD_FILES" <<'PY'
+  if ! python3 - "$ARTIFACT_PATH" "$SOURCE_ROOT" "$SOURCE_PAYLOAD_FILES" <<'PY'
 import os
 import shutil
 import sys
@@ -398,7 +418,7 @@ else
   GITHUB_AUTH_HEADER_FILE=
 fi
 
-for relative in $PAYLOAD_FILES; do
+for relative in $SOURCE_PAYLOAD_FILES; do
   [ -f "$SOURCE_ROOT/$relative" ] || fail "PCE package is incomplete: $relative"
 done
 
@@ -465,12 +485,12 @@ if ! path_exists "$VERSION_ROOT"; then
     mkdir -p "$STAGE/$relative" ||
       fail "could not prepare the version staging directory"
   done
-  for relative in $PAYLOAD_FILES; do
+  for relative in $SOURCE_PAYLOAD_FILES; do
     cp "$SOURCE_ROOT/$relative" "$STAGE/$relative" ||
       fail "could not copy $relative"
   done
   chmod 755 "$STAGE/scripts/pce.py" || fail "could not make pce executable"
-  for relative in $PAYLOAD_FILES; do
+  for relative in $SOURCE_PAYLOAD_FILES; do
     [ "$relative" = scripts/pce.py ] || chmod 644 "$STAGE/$relative" ||
       fail "could not set program file modes"
   done
