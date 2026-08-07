@@ -2391,6 +2391,14 @@ def project_state(ns: Path) -> tuple[Path, dict[str, object]]:
     return path, data
 
 
+@dataclass(frozen=True)
+class PendingHarvestTransaction:
+    revision: str
+    review: str
+    state_path: Path
+    paths: tuple[Path, ...]
+
+
 def _staged_paths(root: Path, pathspec: str) -> set[str]:
     return {
         item
@@ -2409,13 +2417,13 @@ def _staged_paths(root: Path, pathspec: str) -> set[str]:
 
 def staged_harvest_transaction(
     repo: Path,
-) -> dict[str, object] | None:
+) -> PendingHarvestTransaction | None:
     """Return and validate the namespace's staged harvest transaction."""
 
     root = store_root()
     if not (root / ".git").exists():
         return None
-    ns, meta = namespace(repo)
+    ns, _meta = namespace(repo)
     namespace_rel = ns.resolve().relative_to(root).as_posix()
     state_path = ns / "state.json"
     state_rel = state_path.resolve().relative_to(root).as_posix()
@@ -2488,15 +2496,12 @@ def staged_harvest_transaction(
             f"transaction: {review_path}"
         )
 
-    return {
-        "repository": str(repo),
-        "key": meta["key"],
-        "revision": revision,
-        "review": review,
-        "review_path": str(review_path),
-        "state_path": str(state_path),
-        "paths": [str(state_path), str(review_path)],
-    }
+    return PendingHarvestTransaction(
+        revision=revision,
+        review=review,
+        state_path=state_path,
+        paths=(state_path, review_path),
+    )
 
 
 def harvest(repo: Path, limit: int) -> dict[str, object]:
@@ -2506,8 +2511,8 @@ def harvest(repo: Path, limit: int) -> dict[str, object]:
     if pending is not None:
         raise PceError(
             "unresolved staged harvest transaction for revision "
-            f"{pending['revision']}; retry pce harvest-mark --revision "
-            f"{pending['revision']} --commit before selecting another batch"
+            f"{pending.revision}; retry pce harvest-mark --revision "
+            f"{pending.revision} --commit before selecting another batch"
         )
     ns, meta = namespace(repo)
     state_path_value, state = project_state(ns)
@@ -2660,22 +2665,22 @@ def harvest_mark_and_commit(
     message = f"chore({meta['key']}): advance harvest watermark"
     pending = staged_harvest_transaction(repo)
     if pending is not None:
-        if pending["revision"] != resolved:
+        if pending.revision != resolved:
             raise PceError(
                 "harvest retry revision does not match the unresolved staged "
-                f"transaction: requested {resolved}, staged {pending['revision']}"
+                f"transaction: requested {resolved}, staged {pending.revision}"
             )
         central_commit = commit_prepared_store(
             message,
-            [Path(path) for path in pending["paths"]],
+            pending.paths,
         )
         central_commit["retried"] = True
         return {
             "repository": str(repo),
             "key": meta["key"],
             "revision": resolved,
-            "review": pending["review"],
-            "state_path": pending["state_path"],
+            "review": pending.review,
+            "state_path": str(pending.state_path),
             "central_commit": central_commit,
         }
 
